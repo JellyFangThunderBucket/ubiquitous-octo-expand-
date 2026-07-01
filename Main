@@ -1,86 +1,221 @@
 // ==UserScript==
 // @name         Facebook Auto Expand Everything
 // @namespace    cody.facebook.expand
-// @version      1.0
-// @description  Automatically expands Facebook comments, replies, and "see more" text.
+// @version      2.0
+// @description  Aggressively expands Facebook comments, replies, reaction/like lists, and "see more" text as soon as content appears.
 // @match        https://www.facebook.com/*
 // @match        https://m.facebook.com/*
 // @match        https://mbasic.facebook.com/*
 // @grant        none
+// @run-at       document-start
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const CLICK_DELAY = 900;
-  const SCAN_INTERVAL = 1500;
+  const CONFIG = {
+    scanInterval: 250,
+    idleScanInterval: 1250,
+    maxClicksPerPass: 80,
+    maxScrollsPerPass: 4,
+    clickCooldown: 700,
+    scrollAmount: 0.95,
+    bootBurstMs: 12000,
+    debug: false
+  };
 
-  const phrases = [
+  const EXPAND_PHRASES = [
     'see more',
+    'show more',
+    'read more',
+    'continue reading',
     'view more comments',
     'view previous comments',
     'view more replies',
+    'view previous replies',
     'view replies',
+    'view reply',
     'more comments',
+    'previous comments',
     'more replies',
-    'show more',
-    'load more'
+    'load more comments',
+    'load more replies',
+    'load more',
+    'all comments',
+    'most relevant',
+    'show all',
+    'see all',
+    'all reactions',
+    'others',
+    'and others',
+    'people reacted',
+    'replies',
+    'comments'
   ];
 
-  function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  const EXACT_SKIP_TEXT = new Set([
+    'like',
+    'liked',
+    'comment',
+    'share',
+    'send',
+    'follow',
+    'unfollow',
+    'join',
+    'joined',
+    'message',
+    'save',
+    'saved'
+  ]);
+
+  const CLICKABLE_SELECTOR = [
+    'a[href]',
+    'button',
+    '[role="button"]',
+    '[role="link"]',
+    '[tabindex="0"]',
+    'summary'
+  ].join(',');
+
+  const clicked = new WeakMap();
+  let queued = false;
+  let lastActivity = Date.now();
+
+  function log(...args) {
+    if (CONFIG.debug) console.log('[FB Auto Expand]', ...args);
   }
 
-  function isVisible(el) {
-    if (!el) return false;
+  function normalizeText(text) {
+    return (text || '')
+      .replace(/\s+/g, ' ')
+      .replace(/[·•]/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  function visible(el) {
+    if (!el || !el.isConnected) return false;
+    const style = getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none' || style.pointerEvents === 'none') return false;
     const rect = el.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
+    return rect.width > 0 && rect.height > 0 && rect.bottom >= -200 && rect.top <= window.innerHeight + 1200;
+  }
+
+  function recentlyClicked(el) {
+    return Date.now() - (clicked.get(el) || 0) < CONFIG.clickCooldown;
+  }
+
+  function hasExpandableCount(text) {
+    return /(?:^|\s)\d+[,.]?\d*\s*(?:k|m)?\s*(?:comments?|replies|shares?|others?|reactions?|likes?)\b/i.test(text)
+      || /\b\d+\s+of\s+\d+\b/i.test(text);
+  }
+
+  function hrefLooksExpandable(el) {
+    const href = (el.getAttribute('href') || '').toLowerCase();
+    return href.includes('comment')
+      || href.includes('reaction')
+      || href.includes('ufi/reaction')
+      || href.includes('likes')
+      || href.includes('feedback');
+  }
+
+  function isUnsafeAction(el, text) {
+    const aria = normalizeText(el.getAttribute('aria-label'));
+    const combined = normalizeText(`${aria} ${text}`);
+
+    if (EXACT_SKIP_TEXT.has(text) || EXACT_SKIP_TEXT.has(aria)) return true;
+    if (/^(like|comment|share|send|follow|join|message|save)\b/.test(combined)) return true;
+    if (/\b(unfriend|block|report|delete|hide|remove|turn on notifications|turn off notifications)\b/.test(combined)) return true;
+
+    return false;
   }
 
   function looksExpandable(el) {
-    const text = (el.innerText || el.textContent || '').trim().toLowerCase();
+    const text = normalizeText(`${el.getAttribute('aria-label') || ''} ${el.innerText || el.textContent || ''}`);
+    if (!text || text.length > 240 || isUnsafeAction(el, text)) return false;
 
-    if (!text) return false;
-
-    return phrases.some(phrase => text.includes(phrase));
+    return EXPAND_PHRASES.some(phrase => text.includes(phrase))
+      || hasExpandableCount(text)
+      || hrefLooksExpandable(el);
   }
 
-  async function expandPage() {
-    const candidates = Array.from(
-      document.querySelectorAll('div[role="button"], span, a, button')
-    ).filter(el => isVisible(el) && looksExpandable(el));
+  function getCandidates(root = document) {
+    const nodes = Array.from(root.querySelectorAll ? root.querySelectorAll(CLICKABLE_SELECTOR) : []);
+    if (root.matches && root.matches(CLICKABLE_SELECTOR)) nodes.unshift(root);
 
-    for (const el of candidates) {
+    return nodes
+      .filter(el => visible(el) && !recentlyClicked(el) && looksExpandable(el))
+      .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+  }
+
+  function fastClick(el) {
+    clicked.set(el, Date.now());
+    el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'auto' });
+    el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
+    el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+    el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+    el.click();
+    lastActivity = Date.now();
+    log('clicked', normalizeText(el.innerText || el.textContent || el.getAttribute('aria-label')));
+  }
+
+  function expand(root = document) {
+    let count = 0;
+    for (const el of getCandidates(root)) {
+      if (count >= CONFIG.maxClicksPerPass) break;
       try {
-        el.scrollIntoView({
-          behavior: 'smooth',
-          block: 'center'
-        });
-
-        await sleep(250);
-        el.click();
-
-        console.log('[FB Auto Expand] Clicked:', el.innerText || el.textContent);
-        await sleep(CLICK_DELAY);
+        fastClick(el);
+        count += 1;
       } catch (err) {
-        console.warn('[FB Auto Expand] Failed to click:', err);
+        log('click failed', err);
       }
+    }
+    return count;
+  }
+
+  function autoScroll() {
+    let scrolls = 0;
+    while (scrolls < CONFIG.maxScrollsPerPass && document.documentElement.scrollHeight - window.scrollY - window.innerHeight > 2) {
+      window.scrollBy({ top: window.innerHeight * CONFIG.scrollAmount, behavior: 'auto' });
+      scrolls += 1;
     }
   }
 
-  async function autoScroll() {
-    window.scrollBy({
-      top: window.innerHeight * 0.85,
-      behavior: 'smooth'
+  function runPass(root = document) {
+    const expanded = expand(root);
+    if (Date.now() - lastActivity < CONFIG.bootBurstMs || expanded > 0) autoScroll();
+  }
+
+  function schedule(root = document) {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      runPass(root);
     });
   }
 
-  async function loop() {
-    await expandPage();
-    await autoScroll();
+  function start() {
+    schedule();
+    setInterval(() => schedule(), CONFIG.scanInterval);
+    setInterval(() => {
+      if (Date.now() - lastActivity > CONFIG.bootBurstMs) schedule();
+    }, CONFIG.idleScanInterval);
+
+    new MutationObserver(mutations => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType === Node.ELEMENT_NODE) schedule(node);
+        }
+      }
+    }).observe(document.documentElement, { childList: true, subtree: true });
+
+    console.log('[FB Auto Expand] Running in aggressive fast-expand mode.');
   }
 
-  setInterval(loop, SCAN_INTERVAL);
-
-  console.log('[FB Auto Expand] Running.');
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start, { once: true });
+  } else {
+    start();
+  }
 })();

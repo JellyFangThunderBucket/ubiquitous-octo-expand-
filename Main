@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         Facebook Auto Expand Everything
 // @namespace    cody.facebook.expand
-// @version      2.0
-// @description  Aggressively expands Facebook comments, replies, reaction/like lists, and "see more" text as soon as content appears.
+// @version      2.1
+// @description  Adds an on-screen/Tampermonkey toggle to expand Facebook comments, replies, reaction/like lists, and "see more" text on demand.
 // @match        https://www.facebook.com/*
 // @match        https://m.facebook.com/*
 // @match        https://mbasic.facebook.com/*
-// @grant        none
+// @grant        GM_registerMenuCommand
 // @run-at       document-start
 // ==/UserScript==
 
@@ -14,13 +14,13 @@
   'use strict';
 
   const CONFIG = {
-    scanInterval: 250,
-    idleScanInterval: 1250,
-    maxClicksPerPass: 80,
-    maxScrollsPerPass: 4,
-    clickCooldown: 700,
-    scrollAmount: 0.95,
-    bootBurstMs: 12000,
+    scanInterval: 450,
+    idleScanInterval: 1500,
+    maxClicksPerPass: 50,
+    maxScrollsPerPass: 2,
+    clickCooldown: 900,
+    scrollAmount: 0.9,
+    bootBurstMs: 8000,
     debug: false
   };
 
@@ -79,6 +79,11 @@
 
   const clicked = new WeakMap();
   let queued = false;
+  let enabled = false;
+  let toggleButton = null;
+  let observer = null;
+  let scanTimer = null;
+  let idleTimer = null;
   let lastActivity = Date.now();
 
   function log(...args) {
@@ -186,31 +191,103 @@
     if (Date.now() - lastActivity < CONFIG.bootBurstMs || expanded > 0) autoScroll();
   }
 
-  function schedule(root = document) {
+  function schedule(root = document, force = false) {
+    if (!enabled && !force) return;
     if (queued) return;
     queued = true;
     requestAnimationFrame(() => {
       queued = false;
-      runPass(root);
+      if (enabled || force) runPass(root);
     });
   }
 
-  function start() {
+  function setButtonState() {
+    if (!toggleButton) return;
+    toggleButton.textContent = enabled ? 'FB Expand: ON' : 'FB Expand: OFF';
+    toggleButton.title = enabled
+      ? 'Facebook Auto Expand is running. Click to stop.'
+      : 'Click to expand comments, replies, likes/reactions, and see-more text.';
+    toggleButton.style.background = enabled ? '#1877f2' : '#3a3b3c';
+  }
+
+  function createToggleButton() {
+    if (toggleButton || !document.body) return;
+
+    toggleButton = document.createElement('button');
+    toggleButton.type = 'button';
+    toggleButton.setAttribute('aria-pressed', String(enabled));
+    toggleButton.style.cssText = [
+      'position:fixed',
+      'right:16px',
+      'bottom:16px',
+      'z-index:2147483647',
+      'border:0',
+      'border-radius:999px',
+      'padding:10px 14px',
+      'color:#fff',
+      'font:600 13px/1.2 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+      'box-shadow:0 4px 14px rgba(0,0,0,.35)',
+      'cursor:pointer'
+    ].join(';');
+    toggleButton.addEventListener('click', () => setEnabled(!enabled));
+    document.body.appendChild(toggleButton);
+    setButtonState();
+  }
+
+  function registerMenu() {
+    if (typeof GM_registerMenuCommand !== 'function') return;
+    GM_registerMenuCommand('Toggle Facebook Auto Expand', () => setEnabled(!enabled));
+    GM_registerMenuCommand('Expand Facebook Page Once', () => schedule(document, true));
+  }
+
+  function startAutomation() {
+    stopAutomation();
+    lastActivity = Date.now();
     schedule();
-    setInterval(() => schedule(), CONFIG.scanInterval);
-    setInterval(() => {
+
+    scanTimer = setInterval(() => schedule(), CONFIG.scanInterval);
+    idleTimer = setInterval(() => {
       if (Date.now() - lastActivity > CONFIG.bootBurstMs) schedule();
     }, CONFIG.idleScanInterval);
 
-    new MutationObserver(mutations => {
+    observer = new MutationObserver(mutations => {
       for (const mutation of mutations) {
         for (const node of mutation.addedNodes) {
           if (node.nodeType === Node.ELEMENT_NODE) schedule(node);
         }
       }
-    }).observe(document.documentElement, { childList: true, subtree: true });
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
 
-    console.log('[FB Auto Expand] Running in aggressive fast-expand mode.');
+  function stopAutomation() {
+    if (scanTimer) clearInterval(scanTimer);
+    if (idleTimer) clearInterval(idleTimer);
+    if (observer) observer.disconnect();
+    scanTimer = null;
+    idleTimer = null;
+    observer = null;
+    queued = false;
+  }
+
+  function setEnabled(nextEnabled) {
+    enabled = nextEnabled;
+    if (toggleButton) toggleButton.setAttribute('aria-pressed', String(enabled));
+    setButtonState();
+
+    if (enabled) {
+      startAutomation();
+      console.log('[FB Auto Expand] Enabled.');
+    } else {
+      stopAutomation();
+      console.log('[FB Auto Expand] Disabled.');
+    }
+  }
+
+  function start() {
+    createToggleButton();
+    registerMenu();
+    console.log('[FB Auto Expand] Ready. Use the on-screen button or Tampermonkey menu to start expanding.');
   }
 
   if (document.readyState === 'loading') {
